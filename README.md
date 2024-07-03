@@ -5,7 +5,7 @@ This repository contains the set up to create a `Rstudio` environment with all t
 
 This is useful to work on the practicals. You may want to also install the full configuration on your local machine, but this is useful if, for example, you don't have full write access to your machine or don't have a fully working `R` installation.
 
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/giabaio/vibass/HEAD?labpath=rstudio)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/giabaio/vibass/HEAD)
 
 ## Using docker locally
 
