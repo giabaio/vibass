@@ -1,0 +1,10 @@
+options(timeout=1600)
+install.packages("tidyverse")
+install.packages("here")
+install.packages("remotes")
+install.packages('BCEA')
+install.packages('rjags')
+install.packages("R2OpenBUGS")
+remotes::install_github("giabaio/R2jags")
+remotes::install_github("giabaio/bmhe_utils")
+

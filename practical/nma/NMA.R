@@ -1,0 +1,81 @@
+# Loads the relevant packages
+library(R2jags)
+library(BCEA)
+
+#' Smoking cessation network meta-analysis data in format obtained
+#' from Lu & Ades tutorial "Introduction to Mixed Treatment Comparisons"
+load(here::here("nma","smoke.Rdata"))
+
+# Explores the data object just loaded
+names(smoke.list)
+lapply(smoke.list,class)
+
+# Initial values
+inits <- list(list(mu=rep(0,24), d=c(NA,0,0,0)),
+              list(mu=rep(-1,24), d=c(NA,1,1,1)))
+
+# FIXED EFFECTS MODEL
+
+# Pilot run with no burn-in, to illustrate convergence using traceplots
+res <- jags(
+  model=here::here("nma","smokefix_model.txt"), 
+  data=smoke.list, inits=inits,
+  parameters.to.save=c("d"),
+  n.chains=2, n.burnin=0, n.iter=1000,n.thin=1
+)
+# Traceplots
+bmhe::traceplot(res)
+
+# Can also select a specific node, for example
+bmhe::traceplot(res,parameter="d")
+
+# Run the model for longer and with a specific burnin
+res <- jags(
+  model=here::here("nma","smokefix_model.txt"), 
+  data=smoke.list, inits=inits,
+  parameters.to.save=c("d","L","pq"),
+  n.chains=2, n.burnin=1000, n.iter=5000, n.thin=1
+)
+# Prints the summary table
+res
+
+#' How many further iterations do we need after convergence?  Consider
+#' the "effective sample size".  Rule of thumb is you need n.eff>4000
+#' to ensure 95\% credible limits have 94.5-95.5% coverage (true in
+#' this case).  
+
+# RANDOM EFFECTS MODEL.  
+# Check convergence of random effects SD in particular
+
+inits <- list(list(mu=rep(0,24), d=c(NA,0,0,0), sd=1),
+              list(mu=rep(-1,24), d=c(NA,1,1,1), sd=2))
+
+res2 <- jags(
+  model=here::here("nma","smokere_model.txt"), 
+  data=smoke.list, inits=inits,
+  parameters.to.save=c("or", "d", "sd", "pq", "L"),
+  n.chains=2, n.burnin=2000, n.iter=10000, n.thin=4
+)
+print(res2,digits=3)
+
+### Cost-effectiveness analysis
+unit.cost <- c(0,200,6000,600)
+ints <- c("No contact","Self help","Individual counselling","Group counselling")
+e <- c <- matrix(NA,res2$BUGSoutput$n.sims,4)
+# MCMC sample from distribution of life-years gained by quitting
+L <- res2$BUGSoutput$sims.list$L 
+# ...and from distributions of probability of quitting for each of 4 interventions
+pq <- res2$BUGSoutput$sims.list$pq 
+
+# Create population average for benefits (e) and costs (c)
+for (t in 1:4) {
+    e[,t] <- L*pq[,t]
+    c[,t] <- unit.cost[t]
+}
+colnames(e) <- colnames(c) <- ints
+round(apply(e, 2, quantile, c(0.025, 0.5, 0.975)), 1) # results on slide
+
+# Runs BCEA
+m <- bcea(e,c,interventions=ints,Kmax=1000,ref=4)
+summary(m)
+plot(m)

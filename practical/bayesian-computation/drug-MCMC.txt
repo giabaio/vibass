@@ -1,0 +1,10 @@
+model {
+# Model for the drug example
+   # Prior distribution for `theta`
+   theta    ~ dbeta(a,b)
+   # Sampling distribution for the data `y`, given the parameter `theta`
+   y        ~ dbin(theta,m)
+   # Predictive distribution for "new data" `y.pred`
+   y.pred   ~ dbin(theta,n)
+   P.crit  <- step(y.pred - ncrit + 0.5) # =1 if y.pred >= ncrit
+}

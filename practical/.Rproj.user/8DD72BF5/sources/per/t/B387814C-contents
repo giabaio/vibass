@@ -1,0 +1,531 @@
+#' Load the relevant packages
+library(tinytable)
+#' Load the data for the 10TT trial. This is a synthetic dataset --- it is 
+#' generated starting from the *real* trial data, but the actual variables do 
+#' not have the exact same values.
+#' 
+#' Also, for simplicity, here we remove the missing data, with the command
+#' |> drop_na()
+ttt=read.csv(here::here("ild/10TT_synth_280921.csv")) |> as_tibble() |>
+  drop_na()
+
+#' Can visualise the data, by simply calling the name of the object
+ttt
+
+#' Manipulate the original data, first to compute discounting and then to 
+#' compute the QALYs, starting from the utility data
+#' 
+#' 1. Defines a simple function to do the discounting. This assumes a 
+#' default discount rate of 3.5%, but can be changed as it is a single input
+#' to the function
+disc=function(x, year, disc_rate = 0.035) {
+  x / ((1 + disc_rate)^(year - 1))
+}
+
+#' 2. Creates a temporary dataset (df_qol) with the utility and QALY data
+#' with discounting by using a "long format" (one row per time point, repeated
+#' over the individuals)
+df_qol=ttt |> 
+  ## select columns of interest
+  select(id, arm, contains("qol")) |>
+  ## convert dataframe from wide to long format
+  pivot_longer(
+    contains("qol"), names_to = "month", names_prefix = "qol_", 
+    names_transform = list(month = as.integer), values_to = "qol"
+  ) |>  
+  # convert month to follow-up year; set baseline to be in year 1
+  mutate(year = pmax(1, ceiling(month/12))) |>
+  ## apply discounting
+  mutate(qol_disc = disc(qol, year)) |> 
+  # group by individual
+  group_by(id) |> mutate(
+  # time duration between measurements 
+    delta=month-dplyr::lag(month,default = 0),
+  # sum of utilities between two consecutive time points
+    du=qol_disc+dplyr::lag(qol_disc,default = 0),
+  # area under the curve (AUC)
+    auc=du*delta/2
+  ) |> 
+  # compute the QALYs (in years so divide by 12!), as sum of the AUC 
+  # for all time points
+  summarise(qaly=sum(auc)/12) |> ungroup()
+
+#' 3. Merges the overall QALYs to the main dataset
+ttt=ttt |> left_join(df_qol,by=c("id"="id")) |> 
+  mutate(
+    Trt=arm+1,arm=factor(arm),
+    arm=case_when(arm=="0"~"Control",TRUE~"Treatment")
+  )
+
+#' Visualise the dataset again --- now there variable 'qaly' has been added
+ttt
+
+#' Uses ggplot to visualise the distribution of the raw data in terms of 
+#' suitable histograms
+#' 
+#' For the QALYs (effects)
+ttt |> ggplot(aes(qaly)) + geom_histogram(fill="grey",col="black") + 
+  facet_grid(.~as.factor(arm)) + xlab("QALYs") + ylab("")
+
+#' and for the costs
+ttt |> ggplot(aes(totalcost)) + geom_histogram(fill="grey",col="black") + 
+  facet_grid(.~as.factor(arm)) + xlab("Total costs (GBP)") + ylab("")
+
+
+#' 1. Normal/Normal independent model
+#' Visualises the priors chosen for the model parameters
+#' for the regression coefficients
+ggplot() + stat_function(fun=dnorm,args=list(mean=0,sd=100)) + xlim(-500,500) +
+  xlab("") + ylab("")
+
+#' Then for the standard deviation of the effects
+ggplot() + stat_function(fun=dexp,args=list(rate=5.75)) + xlim(0,2) +
+  xlab("") + ylab("")
+
+#' And then for the standard deviation of the costs
+ggplot() + stat_function(fun=dexp,args=list(rate=0.025)) + xlim(0,250) +
+  xlab("") + ylab("")
+
+#' Defines the model code --- using a R function
+#' Normal/Normal independent model - JAGS code
+nn_indep=function(){
+  for (i in 1:N) {
+    # Model for the effects
+    e[i] ~ dnorm(phi.e[i], tau.e[Trt[i]])
+    phi.e[i] <- alpha0 + alpha1*(Trt[i]-1) + alpha2*u0star[i]
+    # Model for the costs
+    c[i] ~ dnorm(phi.c[i], tau.c[Trt[i]])
+    phi.c[i] <- beta0 + beta2*(Trt[i]-1)
+  }
+  # Rescales the main economic parameters
+  for (t in 1:2) {
+    mu.e[t] <- alpha0 + alpha1*(t-1)
+    mu.c[t] <- beta0 + beta2*(t-1)
+  }
+  # Minimally informative priors on the regression coefficients
+  alpha0 ~ dnorm(0,0.0001)
+  alpha1 ~ dnorm(0,0.0001)
+  alpha2 ~ dnorm(0,0.0001)
+  beta0 ~ dnorm(0,0.0001)
+  beta2 ~ dnorm(0,0.0001)
+  for (t in 1:2) {
+  # PC-prior on the sd with Pr(sigma_e>0.8) \approx 0.01
+    sigma.e[t] ~ dexp(5.75)
+    tau.e[t] <- pow(sigma.e[t],-2)
+  # PC-prior on the sd with Pr(sigma_c>100) \approx 0.1
+    sigma.c[t] ~ dexp(0.025)
+    tau.c[t] <- pow(sigma.c[t],-2)
+  }
+}
+
+#' Prepares the data as row vectors. For now use QALYs in the natural scale
+e=ttt$qaly
+c=ttt$totalcost
+Trt=ttt$Trt
+u0star=scale(ttt$qol_0,scale=F) |> as.numeric()
+N=ttt |> nrow()
+
+#' And then put all the relevant data in a list
+data=list(e=e,c=c,Trt=Trt,u0star=u0star,N=N)
+
+#' Initialises the object 'model' as a list to store all the results
+model=list()
+
+#' Runs JAGS in the background
+library(R2jags)
+# Stores the JAGS output as an element named 'nn_indep' in the object 'model'
+model$nn_indep=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mu.c","alpha0","alpha1","alpha2","beta0","beta2","sigma.e","sigma.c"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000,n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'nn_indep'
+  model.file=nn_indep
+)
+
+# Shows the summary statistics from the posterior distributions. 
+print(model$nn_indep,digits=3,interval=c(0.025,0.5,0.975))
+
+
+#' 2. Normal/Normal MCF model
+#' Normal/Normal MCF - JAGS code
+nn_mcf=function(){
+  for (i in 1:N) {
+    # Marginal model for the effects
+    e[i] ~ dnorm(phi.e[i], tau.e[Trt[i]])
+    phi.e[i] <- alpha0 + alpha1*(Trt[i]-1) + alpha2*u0star[i]
+    # *Conditional* model for the costs
+    c[i] ~ dnorm(phi.c[i], tau.c[Trt[i]])
+    phi.c[i] <- beta0 + beta1*(e[i]-mu.e[Trt[i]]) + beta2*(Trt[i]-1)
+  }
+  # Rescales the main economic parameters
+  for (t in 1:2) {
+    mu.e[t] <- alpha0 + alpha1*(t-1)
+    mu.c[t] <- beta0 + beta2*(t-1)
+  }
+  # Minimally informative priors on the regression coefficients
+  alpha0 ~ dnorm(0,0.0001)
+  alpha1 ~ dnorm(0,0.0001)
+  alpha2 ~ dnorm(0,0.0001)
+  beta0 ~ dnorm(0,0.0001)
+  beta1 ~ dnorm(0,0.0001)
+  beta2 ~ dnorm(0,0.0001)
+  for (t in 1:2) {
+  # PC-prior on the *marginal* sd with Pr(sigma_e>0.8) \approx 0.01
+    sigma.e[t] ~ dexp(5.75)
+    tau.e[t] <- pow(sigma.e[t],-2)
+  # PC-prior on the *conditional* sd with Pr(lambda_c>100) \approx 0.1
+    lambda.c[t] ~ dexp(0.025)
+    tau.c[t] <- pow(lambda.c[t],-2)
+  # Retrieves the correlation coefficients
+    rho[t] <- beta1*sigma.e[t]/sigma.c[t]
+  # And the *marginal* standard deviation for the cost
+    sigma.c[t] <- sqrt(pow(lambda.c[t],2) + pow(sigma.e[t],2)*pow(beta1,2))
+  }
+}
+
+#' Runs JAGS in the background and stores the output in the element 'nn_mcf' 
+model$nn_mcf=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mu.c","alpha0","alpha1","alpha2","beta0","beta1","beta2",
+    "sigma.e","sigma.c","lambda.c","rho"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000,n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'nn_mcf'
+  model.file=nn_mcf
+)
+
+# Shows the summary statistics from the posterior distributions. 
+print(model$nn_mcf,digits=3,interval=c(0.025,0.5,0.975))
+
+
+#' We don't necessarily need to include all the parameters in the JAGS code ---
+#' some of them are computed as deterministic functions of other "core" 
+#' parameters and so could be obtained after the JAGS model is run...
+#' 
+#' Extracts the simulations from the BUGS object into R variables
+lambda.c=model$nn_mcf$BUGSoutput$sims.list$lambda.c 
+sigma.e=model$nn_mcf$BUGSoutput$sims.list$sigma.e
+beta1=model$nn_mcf$BUGSoutput$sims.list$beta1
+
+#' Defines the new variables --- note the dimensions!
+sigma.c=rho=matrix(NA,nrow=nrow(lambda.c),ncol=ncol(lambda.c))
+
+#' Uses the simulated values to compute rho[t] and sigma.c[t]
+for (t in 1:2) {
+  sigma.c[,t] <- sqrt(lambda.c[,t]^2 + (sigma.e[,t]^2*beta1^2))
+  rho[,t] <- beta1*sigma.e[,t]/sigma.c[,t]
+}
+
+#' Summarises the results --- these are *obviously* identical with the one 
+#' originally computed by JAGS
+colnames(sigma.c)=c("sigma.c[1]","sigma.c[2]")
+colnames(rho)=c("rho[1]","rho[2]")
+cbind(sigma.c,rho) |> bmhe::stats() |> round(digits=3)
+
+
+#' Compares the two Normal/Normal models in terms of outcome using the bmhe
+#' package
+#' 
+#' Creates 'coefplots' for the two models and extracts the resulting data
+#' in objects 'toplot1' (Normal/Normal independent) and 'toplot2' 
+#' (Normal/Normal MCF)
+toplot1=bmhe::coefplot(
+  model$nn_indep,parameter=c("alpha","mu.e","sigma.e")
+)$data
+toplot2=bmhe::coefplot(
+  model$nn_mcf,parameter=c("alpha","mu.e","sigma.e","rho")
+)$data
+
+#' Uses ggplot to create the relevant plots
+#'
+#' First for alpha, mu.e and sigma.e
+toplot1 |> ggplot(aes(mean, Parameter)) + 
+  geom_linerange(
+    aes(xmin =`2.5%`, xmax =`97.5%`),position=position_nudge(y=0.1)
+  ) + 
+  geom_point(position = position_nudge(y=0.1)) + theme_bw() + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  labs(x = "Interval estimate") + 
+  geom_linerange(
+    data=toplot2,aes(xmin =`2.5%`, xmax =`97.5%`), 
+    position=position_nudge(y=-.1),col="red"
+  ) +
+  geom_point(data=toplot2,position=position_nudge(y=-0.1),col="red") 
+
+#' And then for beta, mu.c and sigma.c
+toplot1=bmhe::coefplot(
+  model$nn_indep,parameter=c("beta","mu.c","sigma.c")
+)$data
+toplot2=bmhe::coefplot(
+  model$nn_mcf,parameter=c("beta","mu.c","sigma.c")
+)$data
+
+toplot1 |> ggplot(aes(mean, Parameter)) + 
+  geom_linerange(
+    aes(xmin =`2.5%`, xmax =`97.5%`),position=position_nudge(y=0.1)
+  ) + 
+  geom_point(position = position_nudge(y=0.1)) + theme_bw() + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  labs(x = "Interval estimate") + 
+  geom_linerange(
+    data=toplot2,aes(xmin =`2.5%`, xmax =`97.5%`), 
+    position=position_nudge(y=-.1),col="red"
+  ) +
+  geom_point(data=toplot2,position=position_nudge(y=-0.1),col="red") 
+
+
+#' 3. Gamma/Gamma MCF model
+#' Gamma/Gamma MCF - JAGS code
+gg_mcf=function(){
+  for (i in 1:N) {
+   # Marginal model for the *rescaled* effects
+   estar[i] ~ dgamma(nu.e[Trt[i]], gamma.e[Trt[i],i])
+   gamma.e[Trt[i],i] <- nu.e[Trt[i]]/phi.e[i]
+   log(phi.e[i]) <- alpha0 + alpha1*(Trt[i]-1) + alpha2*u0star[i]
+   # Conditional model for the costs
+   c[i] ~ dgamma(nu.c[Trt[i]], gamma.c[Trt[i],i])
+   gamma.c[Trt[i],i] <- nu.c[Trt[i]]/phi.c[i]
+   log(phi.c[i]) <- beta0 + beta1*(estar[i]-mustar.e[Trt[i]]) + beta2*(Trt[i]-1)
+  }
+  # Rescales the main economic parameters
+  for (t in 1:2) {
+   mustar.e[t] <- exp(alpha0 + alpha1*(t-1))
+   mu.e[t] <- 3 - mustar.e[t]
+   mu.c[t] <- exp(beta0 + beta1*(t-1))
+  }
+  # Minimally informative priors on the regression coefficients
+  alpha0 ~ dnorm(0,0.0001)
+  alpha1 ~ dnorm(0,0.0001)
+  alpha2 ~ dnorm(0,0.0001)
+  beta0 ~ dnorm(0,0.0001)
+  beta1 ~ dnorm(0,0.0001)
+  beta2 ~ dnorm(0,0.0001)
+  # PC prior on the shape parameters 
+  # assume that Pr(nu.e>30) = Pr(nu.c>30) \approx 0.01
+  for (t in 1:2) {
+    nu.e[t] ~ dexp(0.15)
+    nu.c[t] ~ dexp(0.15)
+  }
+}
+
+
+#' Defines the rescaled QALYs in the data list and remove the old version
+data$estar=3-data$e
+
+#' Runs JAGS in the background and stores the output in the element 'gg_mcf' 
+model$gg_mcf=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mustar.e","mu.c","alpha0","alpha1","alpha2","beta0",
+    "beta1","beta2","nu.e","nu.c"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000, n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'model.code'
+  model.file=gg_mcf
+)
+
+# Shows the summary statistics from the posterior distributions. 
+print(model$gg_mcf,digits=3,interval=c(0.025,0.5,0.975))
+
+
+#' ***OPTIONAL*** g-computation and MC simulations 
+#' Extracts the relevant parameters from the JAGS object 
+nu.e=model$gg_mcf$BUGSoutput$sims.list$nu.e
+mustar.e=model$gg_mcf$BUGSoutput$sims.list$mustar.e
+
+# Compute the "average" rate 
+rate=nu.e/mustar.e
+
+# g-computation for the mean on the original scale
+# 1. defines the number of MC simulations for the outcome
+N=4000
+# 2. defines the dimension of the object 'mu' in which to store the means
+mu=matrix(NA,nrow=nrow(rate),ncol=2)
+# 3. loops over the simulations for 'nu.e' and 'rate' 
+for (i in 1:nrow(nu.e)) {
+  for (t in 1:2) {
+# Simulate 'mcsim' values of estar, for the current value of the parameters
+    estar=rgamma(N,shape=nu.e[i,t],rate=rate[i,t])
+# Computes the mean for the *inverse transformation*
+    mu[i,t]=3-estar |> mean()
+  }
+}
+
+#' Computes the summary statistics --- the values are effectively identical
+#' to the ones computed directly in JAGS
+colnames(mu)=c("mu.e[1]","mu.e[2]")
+mu |> bmhe::stats()
+
+
+#' Computing pD manually --- NB: we will *never* really need to do this, but
+#' it's good to have some idea of what kind of computation is actually 
+#' going on, under the hood...
+#'
+#' 1. Model for the effects
+#' Extracts the shape parameter 
+nu.e=c(
+  model$gg_mcf$BUGSoutput$summary["nu.e[1]","mean"],
+  model$gg_mcf$BUGSoutput$summary["nu.e[2]","mean"]
+)
+#' Extracts the regression coefficients 
+alpha0=model$gg_mcf$BUGSoutput$summary["alpha0","mean"]
+alpha1=model$gg_mcf$BUGSoutput$summary["alpha1","mean"]
+alpha2=model$gg_mcf$BUGSoutput$summary["alpha2","mean"]
+#' Computes the linear predictor
+trt=data$Trt-1
+u0=data$u0star
+log.phi.e=alpha0 + alpha1*trt + alpha2*u0
+#' Computes the overall mean 
+mustar.e=numeric()
+for (t in 1:2) {
+  mustar.e[t] <- exp(alpha0 + alpha1*(t-1))
+}
+#' Computes the rate parameter
+gamma.e=numeric()
+for (i in 1:data$N) {
+  gamma.e[i]=nu.e[data$Trt[i]]/exp(log.phi.e[i])
+}
+#' Computes the likelihood contribution from each observation
+lik.e=-2*dgamma(data$estar,shape=nu.e[data$Trt],rate=gamma.e,log=TRUE) 
+
+#' 2. Model for the costs
+#' Extracts the shape parameter 
+nu.c=c(
+  model$gg_mcf$BUGSoutput$summary["nu.c[1]","mean"],
+  model$gg_mcf$BUGSoutput$summary["nu.c[2]","mean"]
+)
+#' Extracts the regression coefficients 
+beta0=model$gg_mcf$BUGSoutput$summary["beta0","mean"]
+beta1=model$gg_mcf$BUGSoutput$summary["beta1","mean"]
+beta2=model$gg_mcf$BUGSoutput$summary["beta2","mean"]
+#' Computes the linear predictor
+log.phi.c=beta0 + beta1*(data$estar-mustar.e[data$Trt]) + beta2*(trt)
+#' Computes the rate parameter
+gamma.c=numeric()
+for (i in 1:data$N) {
+  gamma.c[i]=nu.c[data$Trt[i]]/exp(log.phi.c[i])
+}
+#' Computes the likelihood contribution from each observation
+lik.c=-2*dgamma(data$c,shape=nu.c[data$Trt],rate=gamma.c,log=TRUE) 
+
+#' 3. Finally computes pD & DIC
+#' Computes the average model deviance
+dbar=model$gg_mcf$BUGSoutput$summary["deviance","mean"]
+#' Computes the deviance at the average value for the parameters
+dhat=sum(lik.e) + sum(lik.c)
+#' Computes pD
+pD=dbar-dhat
+#' Computes DIC
+DIC=dbar+pD
+
+
+#' Re-computes the models adding the option 'pD=TRUE' so that both versions of
+#' the penalty (pV and pD) are automatically computed
+#' 
+#' Normal/Normal independent
+model$nn_indep=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mu.c","alpha0","alpha1","alpha2","beta0","beta2","sigma.e","sigma.c"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000,n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'nn_indep'
+  model.file=nn_indep,pD=TRUE
+)
+#' Normal/Normal MCF
+model$nn_mcf=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mu.c","alpha0","alpha1","alpha2","beta0","beta1","beta2",
+    "sigma.e","sigma.c","lambda.c","rho"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000,n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'nn_mcf'
+  model.file=nn_mcf,pD=TRUE
+)
+#' Gamma/Gamma MCF
+model$gg_mcf=jags(
+  data=data,
+  parameters.to.save=c(
+    "mu.e","mustar.e","mu.c","alpha0","alpha1","alpha2","beta0",
+    "beta1","beta2","nu.e","nu.c"
+  ),
+  inits=NULL,n.chains=2,n.iter=5000, n.burnin=3000,n.thin=1,DIC=TRUE,
+  # This specifies the model code as the function 'model.code'
+  model.file=gg_mcf,pD=TRUE
+)
+
+#' Summarises the results in terms of pV, pD and DIC
+tab=tibble(
+  Model=c(
+    "Normal/Normal independent","Normal/Normal MCF","Gamma/Gamma MCF"
+  ),
+  pv=c(
+    model$nn_indep$BUGSoutput$pV |> round(2),
+    model$nn_mcf$BUGSoutput$pV |> round(2),
+    model$gg_mcf$BUGSoutput$pV |> round(2)    
+  ),
+  DIC=c(
+    model$nn_indep$BUGSoutput$DIC |> round(),
+    model$nn_mcf$BUGSoutput$DIC |> round(),
+    model$gg_mcf$BUGSoutput$DIC |> round()
+  ),
+  pd=c(
+    model$nn_indep$BUGSoutput$pD |> round(2),
+    model$nn_mcf$BUGSoutput$pD |> round(2),
+    model$gg_mcf$BUGSoutput$pD |> round(2)
+  ),
+  DIC2=c(
+    model$nn_indep$BUGSoutput$DIC2 |> round(),
+    model$nn_mcf$BUGSoutput$DIC2 |> round(),
+    model$gg_mcf$BUGSoutput$DIC2 |> round()
+  )
+)
+colnames(tab)=c("Model","pV","DIC","pD","DIC")
+tab 
+
+#' Cost-effectiveness analysis
+#' Load 'BCEA'
+library(BCEA)
+
+#' Defines a list of labels for the interventions
+interventions=c("Standard","Active intervention")
+
+#' Sets the reference (t=2=intensive case management)
+ref=2
+
+#' 1. Normal/Normal independent
+#' Defines the variables for effects and costs
+eff=model$nn_indep$BUGSoutput$sims.list$mu.e
+cost=model$nn_indep$BUGSoutput$sims.list$mu.c
+# Runs BCEA  
+m_nn_indep=bcea(
+  eff=eff,cost=cost,interventions=interventions,ref=ref
+)
+
+#' 2. Normal/Normal MCF
+#' Defines the variables for effects and costs
+eff=model$nn_mcf$BUGSoutput$sims.list$mu.e
+cost=model$nn_mcf$BUGSoutput$sims.list$mu.c
+#' Runs BCEA
+m_nn_mcf=bcea(
+  eff=eff,cost=cost,interventions=interventions,ref=ref
+)
+
+#' 3. Gamma/Gamma MCF
+#' Defines the variables for effects and costs
+eff=model$gg_mcf$BUGSoutput$sims.list$mu.e
+cost=model$gg_mcf$BUGSoutput$sims.list$mu.c
+# Runs BCEA
+m_gg_mcf=bcea(
+  eff=eff,cost=cost,interventions=interventions,ref=ref
+)
+
+#' Plots the contour on top of the CE/plane with the 'ggplot' graphical engine 
+contour2(m_nn_indep,graph="gg")
+contour2(m_nn_mcf,graph="gg")
+contour2(m_gg_mcf,graph="gg")
+
